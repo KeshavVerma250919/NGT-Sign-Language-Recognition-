@@ -29,7 +29,8 @@ except ImportError:
 
 # ============== CONFIGURATION ==============
 
-DATA_DIR = "data/dynamic"
+# Path to dynamic templates - your .npy files are in data_dynamic/dynamic/
+DATA_DIR = "data_dynamic/dynamic"
 MIN_FRAMES = 15
 MAX_FRAMES = 150
 
@@ -123,6 +124,13 @@ def normalize_sequence(frames):
 def load_templates():
     """Load all recorded templates"""
     templates = {'H': [], 'J': [], 'Z': []}
+    
+    print(f"\n📂 Looking for templates in: {DATA_DIR}")
+    
+    if not os.path.exists(DATA_DIR):
+        print(f"❌ Directory not found: {DATA_DIR}")
+        print(f"   Please create the folder and subfolders H, J, Z")
+        return templates
     
     for letter in templates.keys():
         letter_dir = os.path.join(DATA_DIR, letter)
@@ -313,13 +321,13 @@ def draw_ui(frame, state, frames_count, result, confidence, debug_results, show_
                 
                 if conf >= MIN_CONFIDENCE:
                     color = (0, 255, 0)  # Green - would be accepted
-                    status = "✓ MATCH"
+                    status = "MATCH"
                 elif conf > 0:
                     color = (0, 200, 200)  # Yellow - close but not enough
                     status = "~ close"
                 else:
                     color = (100, 100, 100)  # Gray - no match
-                    status = "✗ no match"
+                    status = "no match"
                 
                 text = f"{letter}: dist={dist:.2f}, conf={conf:.0%} {status}"
                 cv2.putText(frame, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
@@ -347,6 +355,7 @@ def main():
     print(f"   - Min Confidence: {MIN_CONFIDENCE:.0%} (must be 90%+ sure!)")
     print(f"   - DTW Threshold: {DTW_THRESHOLD}")
     print(f"   - Min Movement: {MOVEMENT_THRESHOLD}")
+    print(f"\n   Data directory: {DATA_DIR}")
     print("\n   Controls:")
     print("   SPACE = Start/Stop | D = Debug | Q = Quit | M = Mirror")
     print("="*60 + "\n")
@@ -354,7 +363,8 @@ def main():
     templates = load_templates()
     
     if sum(len(t) for t in templates.values()) == 0:
-        print("\n❌ No templates! Run: python record_simple.py")
+        print("\n❌ No templates! Run: python record_dynamic_full_hand.py")
+        print(f"   Make sure folder exists: {DATA_DIR}/H/, {DATA_DIR}/J/, {DATA_DIR}/Z/")
         return
     
     cap = cv2.VideoCapture(0)

@@ -52,7 +52,7 @@ import mediapipe as mp
 
 # Paths
 STATIC_MODEL_PATH = "models/random_forest.joblib"
-DYNAMIC_TEMPLATES_DIR = "data/dynamic"
+DYNAMIC_TEMPLATES_DIR = "data_dynamic/dynamic"
 
 # Static letters (Random Forest)
 STATIC_LETTERS = list("ABCDEFGIKLMNOPQRSTUVWXY")
@@ -172,7 +172,7 @@ def load_dynamic_templates():
         for letter, temps in templates.items():
             print(f"   {letter}: {len(temps)} samples")
     else:
-        print("⚠ No dynamic templates found in data/dynamic/")
+        print("⚠ No dynamic templates found in data_dynamic/")
     
     return templates
 
@@ -492,7 +492,7 @@ def main():
     if not has_static and not has_dynamic:
         print("\n❌ No models available!")
         print("   - For static: Run train_model.ipynb")
-        print("   - For dynamic: Run record_simple.py")
+        print("   - For dynamic: Run record_dynamic_full_hand.py")
         return
     
     print(f"\n✓ Static letters: {'ENABLED' if has_static else 'DISABLED'}")

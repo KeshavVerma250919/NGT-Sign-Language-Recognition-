@@ -20,7 +20,8 @@ from datetime import datetime
 
 # ============== CONFIGURATION ==============
 
-DATA_DIR = "data/dynamic"
+# Path to dynamic templates - your .npy files are in data_dynamic/dynamic/
+DATA_DIR = "data_dynamic/dynamic"
 MIN_FRAMES = 15
 MAX_FRAMES = 150
 
@@ -352,6 +353,7 @@ def main():
     print("   NGT DYNAMIC LETTER RECORDER - V5")
     print("="*60)
     print("\n   Records ALL 21 hand landmarks for precise recognition!")
+    print(f"\n   Data directory: {DATA_DIR}")
     print("\n   Controls:")
     print("   H, J, Z = Select letter")
     print("   SPACE   = Start/Stop recording")
@@ -587,7 +589,7 @@ def main():
         count = get_sample_count(letter)
         status = "✅" if count >= 15 else "⚠️ Need more!"
         print(f"   {letter}: {count} samples {status}")
-    print("\n   Run 'python recognize.py' to test recognition!")
+    print("\n   Run 'python recognize_dynamic.py' to test recognition!")
     print("="*60 + "\n")
 
 

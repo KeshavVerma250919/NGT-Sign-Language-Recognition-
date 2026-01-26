@@ -1,0 +1,778 @@
+"""
+NGT Sign Language - Data Collection for Temporal Transformer
+============================================================
+Collects SEQUENTIAL landmark data for ALL 26 letters (A-Z).
+
+Key Features:
+- Records multiple frames per sample (not just one)
+- Stores in CSV format with sample_id, frame_id
+- Includes z-coordinate (63 features per frame)
+- Different frame counts for static vs dynamic letters
+
+Data Format:
+    sample_id, frame_id, x0, y0, z0, x1, y1, z1, ..., x20, y20, z20, label
+
+Controls:
+    0-9, A-Z  = Select letter
+    SPACE     = Start/Stop recording
+    P         = Preview last recording
+    R         = Re-record last sample (delete and redo)
+    Q         = Quit and save
+
+Usage:
+    1. Run script
+    2. Select letter (press key)
+    3. Press SPACE to start recording
+    4. Hold pose (static) or do gesture (dynamic)
+    5. Recording auto-stops when frame count reached
+    6. Repeat until enough samples collected
+"""
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import pandas as pd
+import os
+from datetime import datetime
+
+# ============== CONFIGURATION ==============
+
+# Output
+DATA_DIR = "data"
+OUTPUT_FILE = os.path.join(DATA_DIR, "sequences.csv")
+
+# All 26 letters
+STATIC_LETTERS = list("ABCDEFGIKLMNOPQRSTUVWXY")  # 23 letters
+DYNAMIC_LETTERS = list("HJZ")  # 3 letters
+ALL_LETTERS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")  # 26 letters
+
+# Frame counts per sample
+FRAMES_STATIC = 45    # ~1.5 seconds at 30fps
+FRAMES_DYNAMIC = 75   # ~2.5 seconds at 30fps
+
+# Target samples per letter
+TARGET_STATIC = 50    # Minimum samples for static letters
+TARGET_DYNAMIC = 100  # Minimum samples for dynamic letters
+
+# Colors (BGR)
+COLOR_GREEN = (0, 255, 0)
+COLOR_RED = (0, 0, 255)
+COLOR_YELLOW = (0, 255, 255)
+COLOR_WHITE = (255, 255, 255)
+COLOR_CYAN = (255, 255, 0)
+COLOR_ORANGE = (0, 165, 255)
+COLOR_MAGENTA = (255, 0, 255)
+
+# Finger colors for visualization
+FINGER_COLORS = {
+    'Thumb': COLOR_ORANGE,
+    'Index': COLOR_GREEN,
+    'Middle': COLOR_CYAN,
+    'Ring': COLOR_YELLOW,
+    'Pinky': COLOR_MAGENTA,
+}
+
+FINGERTIP_INDICES = {
+    'Thumb': 4,
+    'Index': 8,
+    'Middle': 12,
+    'Ring': 16,
+    'Pinky': 20,
+}
+
+# ============== MEDIAPIPE SETUP ==============
+
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    model_complexity=1,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+# ============== HELPER FUNCTIONS ==============
+
+def get_frame_count(letter):
+    """Get required frame count based on letter type"""
+    if letter in DYNAMIC_LETTERS:
+        return FRAMES_DYNAMIC
+    return FRAMES_STATIC
+
+
+def get_target_samples(letter):
+    """Get target sample count based on letter type"""
+    if letter in DYNAMIC_LETTERS:
+        return TARGET_DYNAMIC
+    return TARGET_STATIC
+
+
+def is_dynamic(letter):
+    """Check if letter is dynamic"""
+    return letter in DYNAMIC_LETTERS
+
+
+def create_column_names():
+    """
+    Create column names:
+    sample_id, frame_id, wrist_x, wrist_y, wrist_z, x0, y0, z0, ..., x20, y20, z20, label
+    
+    Total landmark columns: 3 (absolute wrist) + 63 (relative) = 66
+    """
+    columns = ['sample_id', 'frame_id']
+    
+    # Absolute wrist position (for H bounce detection)
+    columns.extend(['wrist_x', 'wrist_y', 'wrist_z'])
+    
+    # All 21 landmarks relative to wrist
+    for i in range(21):
+        columns.extend([f'x{i}', f'y{i}', f'z{i}'])
+    
+    columns.append('label')
+    return columns
+
+
+def extract_landmarks(hand_landmarks):
+    """
+    Extract 66 landmark values:
+    - 3 values: ABSOLUTE wrist position (x, y, z) - for H bounce detection!
+    - 63 values: All 21 landmarks RELATIVE to wrist (hand shape)
+    
+    This captures BOTH:
+    - Hand SHAPE (fingers relative to wrist)
+    - Hand MOVEMENT (absolute wrist position for H bounce)
+    
+    Returns list of 66 floats.
+    """
+    wrist = hand_landmarks.landmark[0]
+    landmarks = []
+    
+    # FIRST: Absolute wrist position (important for H!)
+    landmarks.extend([wrist.x, wrist.y, wrist.z])
+    
+    # THEN: All landmarks relative to wrist (hand shape)
+    for lm in hand_landmarks.landmark:
+        landmarks.extend([
+            lm.x - wrist.x,
+            lm.y - wrist.y,
+            lm.z - wrist.z
+        ])
+    
+    return landmarks  # 66 values total
+
+
+def load_existing_data():
+    """Load existing CSV data or create empty DataFrame"""
+    expected_columns = create_column_names()
+    
+    if os.path.exists(OUTPUT_FILE):
+        df = pd.read_csv(OUTPUT_FILE)
+        print(f"✓ Loaded {len(df)} rows from {OUTPUT_FILE}")
+        
+        # Check if columns match (in case format changed)
+        if list(df.columns) != expected_columns:
+            print(f"⚠️  Column mismatch detected!")
+            print(f"   File has {len(df.columns)} columns, expected {len(expected_columns)}")
+            print(f"   Creating backup and starting fresh...")
+            
+            # Backup old file
+            backup_file = OUTPUT_FILE.replace('.csv', '_backup.csv')
+            df.to_csv(backup_file, index=False)
+            print(f"   Old data saved to: {backup_file}")
+            
+            # Start fresh
+            return pd.DataFrame(columns=expected_columns), 0
+        
+        # Get max sample_id
+        if len(df) > 0:
+            max_id = df['sample_id'].max()
+        else:
+            max_id = -1
+        return df, max_id + 1
+    else:
+        print("Starting with empty dataset")
+        return pd.DataFrame(columns=expected_columns), 0
+
+
+def save_data(df):
+    """Save DataFrame to CSV"""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    df.to_csv(OUTPUT_FILE, index=False)
+    print(f"✓ Saved {len(df)} rows to {OUTPUT_FILE}")
+
+
+def get_sample_counts(df):
+    """Get count of samples (not rows) per letter"""
+    if len(df) == 0:
+        return {}
+    
+    # Count unique sample_ids per label
+    counts = df.groupby('label')['sample_id'].nunique().to_dict()
+    return counts
+
+
+def delete_last_sample(df, letter):
+    """Delete the last sample for a given letter"""
+    if len(df) == 0:
+        return df, False
+    
+    # Find samples with this label
+    letter_samples = df[df['label'] == letter]['sample_id'].unique()
+    
+    if len(letter_samples) == 0:
+        return df, False
+    
+    # Get last sample_id for this letter
+    last_sample_id = letter_samples.max()
+    
+    # Remove all rows with this sample_id
+    df = df[df['sample_id'] != last_sample_id]
+    
+    return df, True
+
+
+def show_preview(frames_data, letter):
+    """
+    Show animated preview of ALL finger movements + wrist.
+    frames_data is a list of 66-value lists (from recording buffer)
+    """
+    if len(frames_data) < 5:
+        print("   Not enough frames to preview")
+        return
+    
+    import numpy as np
+    
+    preview_size = 550
+    frames_arr = np.array(frames_data)
+    
+    # Data format: 66 values
+    # [0:3] = absolute wrist (x, y, z)
+    # [3:66] = 21 landmarks relative to wrist
+    
+    # Extract ALL fingertip trajectories (relative to wrist, so add wrist position back)
+    paths = {}
+    
+    # Get absolute wrist positions
+    wrist_x = frames_arr[:, 0]
+    wrist_y = frames_arr[:, 1]
+    paths['Wrist'] = list(zip(wrist_x, wrist_y))
+    
+    # Get fingertip positions (relative + wrist = absolute for display)
+    for name, idx in FINGERTIP_INDICES.items():
+        # Relative positions start at index 3
+        rel_x = frames_arr[:, 3 + idx * 3]
+        rel_y = frames_arr[:, 3 + idx * 3 + 1]
+        # Convert to absolute for display
+        abs_x = rel_x + wrist_x
+        abs_y = rel_y + wrist_y
+        paths[name] = list(zip(abs_x, abs_y))
+    
+    # Find bounds for normalization
+    all_x = [p[0] for path in paths.values() for p in path]
+    all_y = [p[1] for path in paths.values() for p in path]
+    
+    x_min, x_max = min(all_x), max(all_x)
+    y_min, y_max = min(all_y), max(all_y)
+    
+    margin = 80
+    x_range = max(x_max - x_min, 0.01)
+    y_range = max(y_max - y_min, 0.01)
+    scale = min((preview_size - 2*margin) / x_range, (preview_size - 2*margin) / y_range)
+    
+    # Convert to screen coordinates
+    screen_paths = {}
+    for name, path in paths.items():
+        screen_path = []
+        for x, y in path:
+            sx = int(margin + (x - x_min) * scale)
+            sy = int(margin + (y - y_min) * scale)
+            sx = preview_size - sx  # Mirror for natural view
+            screen_path.append((sx, sy))
+        screen_paths[name] = screen_path
+    
+    # Add wrist color
+    all_colors = dict(FINGER_COLORS)
+    all_colors['Wrist'] = COLOR_WHITE
+    
+    # Animate
+    for i in range(len(frames_data)):
+        frame = np.zeros((preview_size, preview_size, 3), dtype=np.uint8)
+        frame[:] = (40, 40, 40)
+        
+        # Title
+        cv2.putText(frame, f"Preview: Letter {letter}", (20, 35),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLOR_WHITE, 2)
+        
+        letter_type = "DYNAMIC" if letter in DYNAMIC_LETTERS else "STATIC"
+        cv2.putText(frame, f"{letter_type} - ALL fingers + WRIST tracked", (20, 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        
+        # Draw each path's trail
+        for name, screen_path in screen_paths.items():
+            color = all_colors.get(name, (200, 200, 200))
+            
+            # Draw trail up to current frame
+            for j in range(1, min(i + 1, len(screen_path))):
+                alpha = j / (i + 1)
+                trail_color = tuple(int(c * (0.3 + 0.7 * alpha)) for c in color)
+                thickness = 3 if name == 'Wrist' else 2
+                cv2.line(frame, screen_path[j-1], screen_path[j], trail_color, thickness)
+            
+            # Draw current position
+            if i < len(screen_path):
+                radius = 10 if name == 'Wrist' else 8
+                cv2.circle(frame, screen_path[i], radius, color, -1)
+                cv2.circle(frame, screen_path[i], radius + 2, COLOR_WHITE, 1)
+        
+        # Legend
+        y_legend = 90
+        for name in ['Wrist'] + list(FINGER_COLORS.keys()):
+            color = all_colors.get(name, (200, 200, 200))
+            cv2.circle(frame, (30, y_legend), 6, color, -1)
+            label = f"{name} (BOUNCE!)" if name == 'Wrist' and letter == 'H' else name
+            cv2.putText(frame, label, (45, y_legend + 4),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+            y_legend += 20
+        
+        # Frame counter
+        cv2.putText(frame, f"Frame {i+1}/{len(frames_data)}", (20, preview_size - 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        
+        # Instructions
+        cv2.putText(frame, "Press any key to stop preview", (20, preview_size - 15),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+        
+        cv2.imshow("Preview - All Fingers + Wrist", frame)
+        
+        # Wait, but allow early exit
+        if cv2.waitKey(50) != -1:
+            break
+    
+    # Show final frame for a moment
+    cv2.waitKey(500)
+    cv2.destroyWindow("Preview - All Fingers + Wrist")
+
+
+# ============== DRAWING FUNCTIONS ==============
+
+def draw_hand(frame, hand_landmarks):
+    """Draw hand with colored fingertips"""
+    h, w = frame.shape[:2]
+    
+    mp_drawing.draw_landmarks(
+        frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+        mp_drawing.DrawingSpec(color=(0, 180, 0), thickness=2, circle_radius=2),
+        mp_drawing.DrawingSpec(color=(0, 150, 0), thickness=2)
+    )
+    
+    # Colored fingertips
+    fingertips = {
+        4: COLOR_ORANGE,   # Thumb
+        8: COLOR_GREEN,    # Index
+        12: COLOR_CYAN,    # Middle
+        16: COLOR_YELLOW,  # Ring
+        20: COLOR_MAGENTA  # Pinky
+    }
+    
+    for idx, color in fingertips.items():
+        tip = hand_landmarks.landmark[idx]
+        x, y = int(tip.x * w), int(tip.y * h)
+        cv2.circle(frame, (x, y), 8, color, -1)
+        cv2.circle(frame, (x, y), 10, COLOR_WHITE, 2)
+    
+    return frame
+
+
+def draw_progress_bar(frame, current, total, x, y, width, height):
+    """Draw a progress bar"""
+    # Background
+    cv2.rectangle(frame, (x, y), (x + width, y + height), (50, 50, 50), -1)
+    
+    # Progress
+    progress = min(current / total, 1.0)
+    fill_width = int(width * progress)
+    
+    color = COLOR_GREEN if progress >= 1.0 else COLOR_YELLOW
+    cv2.rectangle(frame, (x, y), (x + fill_width, y + height), color, -1)
+    
+    # Border
+    cv2.rectangle(frame, (x, y), (x + width, y + height), COLOR_WHITE, 1)
+    
+    # Text
+    text = f"{current}/{total}"
+    cv2.putText(frame, text, (x + width + 10, y + height - 2),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLOR_WHITE, 1)
+
+
+def draw_letter_grid(frame, current_letter, sample_counts):
+    """Draw letter selection grid at bottom"""
+    h, w = frame.shape[:2]
+    
+    # Panel background
+    panel_height = 160
+    cv2.rectangle(frame, (0, h - panel_height), (w, h), (20, 20, 20), -1)
+    
+    # Title
+    cv2.putText(frame, "Select letter (0-9 for A-J, then press letter key) | SPACE = Record | P = Preview | R = Redo | Q = Quit",
+               (15, h - panel_height + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLOR_WHITE, 1)
+    
+    # Draw letter boxes
+    box_size = 38
+    margin = 4
+    start_x = 15
+    start_y = h - panel_height + 35
+    cols = 13
+    
+    for idx, letter in enumerate(ALL_LETTERS):
+        row = idx // cols
+        col = idx % cols
+        
+        x = start_x + col * (box_size + margin)
+        y = start_y + row * (box_size + margin + 15)
+        
+        # Get sample count
+        count = sample_counts.get(letter, 0)
+        target = get_target_samples(letter)
+        is_dyn = is_dynamic(letter)
+        
+        # Box color based on status
+        if letter == current_letter:
+            box_color = COLOR_GREEN
+            text_color = (0, 0, 0)
+        elif count >= target:
+            box_color = (0, 100, 0)  # Dark green - complete
+            text_color = COLOR_WHITE
+        elif is_dyn:
+            box_color = (100, 50, 0)  # Dark orange - dynamic
+            text_color = COLOR_WHITE
+        else:
+            box_color = (50, 50, 50)  # Gray - incomplete
+            text_color = COLOR_WHITE
+        
+        # Draw box
+        cv2.rectangle(frame, (x, y), (x + box_size, y + box_size), box_color, -1)
+        cv2.rectangle(frame, (x, y), (x + box_size, y + box_size), COLOR_WHITE, 1)
+        
+        # Letter
+        cv2.putText(frame, letter, (x + 10, y + 26),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
+        
+        # Count (small)
+        count_color = COLOR_GREEN if count >= target else COLOR_YELLOW
+        cv2.putText(frame, str(count), (x + 8, y + box_size - 4),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, count_color, 1)
+    
+    # Legend
+    legend_y = h - 20
+    cv2.circle(frame, (20, legend_y), 6, (0, 100, 0), -1)
+    cv2.putText(frame, "Complete", (32, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, COLOR_WHITE, 1)
+    
+    cv2.circle(frame, (110, legend_y), 6, (100, 50, 0), -1)
+    cv2.putText(frame, "Dynamic (H,J,Z)", (122, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, COLOR_WHITE, 1)
+    
+    cv2.circle(frame, (240, legend_y), 6, (50, 50, 50), -1)
+    cv2.putText(frame, "Static", (252, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, COLOR_WHITE, 1)
+    
+    return frame
+
+
+def draw_ui(frame, state, current_letter, sample_counts, frames_recorded, hand_detected):
+    """Draw main UI elements"""
+    h, w = frame.shape[:2]
+    
+    # Top panel
+    cv2.rectangle(frame, (0, 0), (w, 120), (0, 0, 0), -1)
+    
+    if current_letter:
+        letter_type = "DYNAMIC" if is_dynamic(current_letter) else "STATIC"
+        type_color = COLOR_ORANGE if is_dynamic(current_letter) else COLOR_CYAN
+        
+        # Current letter (big)
+        cv2.putText(frame, current_letter, (20, 80),
+                   cv2.FONT_HERSHEY_SIMPLEX, 2.5, COLOR_GREEN, 4)
+        
+        # Letter type
+        cv2.putText(frame, letter_type, (100, 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, type_color, 2)
+        
+        # Sample count
+        count = sample_counts.get(current_letter, 0)
+        target = get_target_samples(current_letter)
+        cv2.putText(frame, f"Samples: {count}/{target}", (100, 70),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 1)
+        
+        # Frame requirement
+        frame_req = get_frame_count(current_letter)
+        cv2.putText(frame, f"Frames per sample: {frame_req}", (100, 95),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+    else:
+        cv2.putText(frame, "Select a letter to begin", (20, 50),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.9, COLOR_YELLOW, 2)
+        cv2.putText(frame, "Press 0-9 for A-J, or press any letter key", (20, 85),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+    
+    # Recording indicator
+    if state == "RECORDING":
+        # Flashing red circle
+        flash = int(cv2.getTickCount() / cv2.getTickFrequency() * 3) % 2
+        rec_color = COLOR_RED if flash else (0, 0, 150)
+        cv2.circle(frame, (w - 100, 40), 15, rec_color, -1)
+        cv2.putText(frame, "REC", (w - 85, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_WHITE, 1)
+        
+        # Progress bar
+        if current_letter:
+            frame_req = get_frame_count(current_letter)
+            draw_progress_bar(frame, frames_recorded, frame_req, w - 250, 70, 200, 20)
+            cv2.putText(frame, f"Recording: {frames_recorded}/{frame_req} frames", 
+                       (w - 250, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_WHITE, 1)
+    
+    elif state == "SAVED":
+        cv2.putText(frame, "SAVED!", (w - 150, 50),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_GREEN, 2)
+    
+    # Hand indicator
+    indicator_color = COLOR_GREEN if hand_detected else COLOR_RED
+    indicator_text = "Hand OK" if hand_detected else "No Hand"
+    cv2.circle(frame, (w - 30, 110), 8, indicator_color, -1)
+    cv2.putText(frame, indicator_text, (w - 100, 115),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.4, indicator_color, 1)
+    
+    # Instructions based on state
+    if state == "WAITING" and current_letter:
+        if is_dynamic(current_letter):
+            instr = f"Press SPACE, then perform the {current_letter} gesture"
+        else:
+            instr = f"Press SPACE while holding the {current_letter} hand shape"
+        cv2.putText(frame, instr, (250, 115),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_YELLOW, 1)
+    
+    return frame
+
+
+# ============== KEY MAPPING ==============
+
+def get_letter_from_key(key):
+    """Map key press to letter"""
+    # Number keys 0-9 for A-J
+    if ord('0') <= key <= ord('9'):
+        idx = key - ord('0')
+        if idx < 10:
+            return ALL_LETTERS[idx]
+    
+    # Letter keys
+    if ord('a') <= key <= ord('z'):
+        return chr(key).upper()
+    if ord('A') <= key <= ord('Z'):
+        return chr(key)
+    
+    return None
+
+
+# ============== MAIN ==============
+
+def main():
+    print("\n" + "="*65)
+    print("   NGT SIGN LANGUAGE - DATA COLLECTION FOR TEMPORAL TRANSFORMER")
+    print("="*65)
+    print("\n   This script collects SEQUENTIAL data for ALL 26 letters.")
+    print("\n   Data format: CSV with sample_id, frame_id, 63 landmarks, label")
+    print(f"\n   Static letters (A-G, I-Y): {FRAMES_STATIC} frames, {TARGET_STATIC} samples each")
+    print(f"   Dynamic letters (H, J, Z): {FRAMES_DYNAMIC} frames, {TARGET_DYNAMIC} samples each")
+    print("\n   Controls:")
+    print("   0-9     = Select letters A-J")
+    print("   A-Z     = Select letter directly")
+    print("   SPACE   = Start recording")
+    print("   P       = Preview last recording")
+    print("   R       = Delete last sample for current letter")
+    print("   Q       = Quit and save")
+    print("="*65 + "\n")
+    
+    # Load existing data
+    df, next_sample_id = load_existing_data()
+    sample_counts = get_sample_counts(df)
+    
+    # Print current progress
+    print("\n📊 Current progress:")
+    total_complete = 0
+    for letter in ALL_LETTERS:
+        count = sample_counts.get(letter, 0)
+        target = get_target_samples(letter)
+        if count >= target:
+            total_complete += 1
+    print(f"   Letters complete: {total_complete}/26")
+    print()
+    
+    # Initialize camera
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    
+    if not cap.isOpened():
+        print("❌ Error: Could not open webcam")
+        return
+    
+    # State
+    state = "WAITING"  # WAITING, RECORDING, SAVED
+    current_letter = None
+    frames_buffer = []
+    last_frames = []  # Store last recording for preview
+    saved_timer = 0
+    
+    print("✅ Ready! Select a letter to begin.\n")
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frame = cv2.flip(frame, 1)  # Mirror
+        h, w = frame.shape[:2]
+        
+        # Process hand
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb)
+        
+        hand_detected = False
+        hand_landmarks = None
+        
+        if results.multi_hand_landmarks:
+            hand_detected = True
+            hand_landmarks = results.multi_hand_landmarks[0]
+            frame = draw_hand(frame, hand_landmarks)
+        
+        # Recording logic
+        if state == "RECORDING" and hand_detected and current_letter:
+            # Extract and store landmarks
+            landmarks = extract_landmarks(hand_landmarks)
+            frames_buffer.append(landmarks)
+            
+            # Check if we have enough frames
+            frame_req = get_frame_count(current_letter)
+            if len(frames_buffer) >= frame_req:
+                # Save sample
+                for frame_id, lm in enumerate(frames_buffer):
+                    row = [next_sample_id, frame_id] + lm + [current_letter]
+                    df.loc[len(df)] = row
+                
+                # Store for preview
+                last_frames = frames_buffer.copy()
+                
+                next_sample_id += 1
+                sample_counts = get_sample_counts(df)
+                
+                count = sample_counts.get(current_letter, 0)
+                print(f"   ✅ Saved {current_letter} sample #{count} ({len(frames_buffer)} frames)")
+                print(f"   💡 Press P to preview")
+                
+                frames_buffer = []
+                state = "SAVED"
+                saved_timer = 30  # Show "SAVED" for ~1 second
+        
+        # Handle SAVED state timer
+        if state == "SAVED":
+            saved_timer -= 1
+            if saved_timer <= 0:
+                state = "WAITING"
+        
+        # Handle lost hand during recording
+        if state == "RECORDING" and not hand_detected:
+            print("   ⚠️  Hand lost! Recording cancelled.")
+            frames_buffer = []
+            state = "WAITING"
+        
+        # Draw UI
+        frame = draw_ui(frame, state, current_letter, sample_counts, 
+                       len(frames_buffer), hand_detected)
+        frame = draw_letter_grid(frame, current_letter, sample_counts)
+        
+        cv2.imshow("NGT Data Collection - Temporal Transformer", frame)
+        
+        # Handle input
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord('q'):
+            break
+        
+        elif key == ord(' '):  # SPACE - Start recording
+            if current_letter and hand_detected and state == "WAITING":
+                state = "RECORDING"
+                frames_buffer = []
+                print(f"\n   🔴 Recording {current_letter}...")
+            elif not current_letter:
+                print("   ⚠️  Select a letter first!")
+            elif not hand_detected:
+                print("   ⚠️  Show your hand first!")
+            elif state == "RECORDING":
+                print("   ⚠️  Already recording!")
+        
+        elif key == ord('r'):  # R - Delete last sample
+            if current_letter:
+                df, deleted = delete_last_sample(df, current_letter)
+                if deleted:
+                    sample_counts = get_sample_counts(df)
+                    count = sample_counts.get(current_letter, 0)
+                    print(f"   🗑️  Deleted last {current_letter} sample. Remaining: {count}")
+                else:
+                    print(f"   ⚠️  No samples to delete for {current_letter}")
+        
+        elif key == ord('p'):  # P - Preview last recording
+            if last_frames and current_letter:
+                print(f"\n   👁️  Showing preview of last {current_letter} recording...")
+                show_preview(last_frames, current_letter)
+            else:
+                print("   ⚠️  No recording to preview. Record something first!")
+        
+        else:
+            # Check for letter selection
+            new_letter = get_letter_from_key(key)
+            if new_letter and state != "RECORDING":
+                current_letter = new_letter
+                letter_type = "DYNAMIC" if is_dynamic(current_letter) else "STATIC"
+                count = sample_counts.get(current_letter, 0)
+                target = get_target_samples(current_letter)
+                print(f"\n📝 Selected: {current_letter} ({letter_type}) - {count}/{target} samples")
+    
+    # Cleanup
+    cap.release()
+    cv2.destroyAllWindows()
+    hands.close()
+    
+    # Save data
+    save_data(df)
+    
+    # Final summary
+    print("\n" + "="*65)
+    print("   DATA COLLECTION COMPLETE")
+    print("="*65)
+    
+    sample_counts = get_sample_counts(df)
+    
+    print("\n   📊 Final sample counts:\n")
+    print("   STATIC LETTERS:")
+    for letter in STATIC_LETTERS:
+        count = sample_counts.get(letter, 0)
+        target = TARGET_STATIC
+        status = "✅" if count >= target else f"⚠️ Need {target - count} more"
+        bar = "█" * min(count // 2, 25)
+        print(f"   {letter}: {count:3d}/{target}  {bar} {status}")
+    
+    print("\n   DYNAMIC LETTERS:")
+    for letter in DYNAMIC_LETTERS:
+        count = sample_counts.get(letter, 0)
+        target = TARGET_DYNAMIC
+        status = "✅" if count >= target else f"⚠️ Need {target - count} more"
+        bar = "█" * min(count // 2, 25)
+        print(f"   {letter}: {count:3d}/{target}  {bar} {status}")
+    
+    # Total stats
+    total_samples = df['sample_id'].nunique() if len(df) > 0 else 0
+    total_rows = len(df)
+    print(f"\n   Total: {total_samples} samples, {total_rows} rows")
+    print(f"   File: {OUTPUT_FILE}")
+    print("="*65 + "\n")
+
+
+if __name__ == "__main__":
+    main()
