@@ -89,8 +89,8 @@ hands = mp_hands.Hands(
     static_image_mode=False,       # MUST be False for video/motion tracking
     max_num_hands=1,
     model_complexity=1,            # Full model for better accuracy
-    min_detection_confidence=0.35, # Balanced - tracks motion but won't detect face as hand
-    min_tracking_confidence=0.35   # Balanced - tracks motion but won't detect face as hand
+    min_detection_confidence=0.4,  # Balanced
+    min_tracking_confidence=0.4    # Balanced
 )
 
 # ============== HELPER FUNCTIONS ==============
@@ -446,7 +446,7 @@ def draw_letter_grid(frame, current_letter, sample_counts):
     cv2.rectangle(frame, (0, h - panel_height), (w, h), (20, 20, 20), -1)
     
     # Title
-    cv2.putText(frame, "Select letter (0-9 for A-J, then press letter key) | SPACE = Record | P = Preview | R = Redo | Q = Quit",
+    cv2.putText(frame, "Select letter (0-9 for A-J, then press letter key) | SPACE = Record | TAB = Preview | BACKSPACE = Redo | ESC = Quit",
                (15, h - panel_height + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLOR_WHITE, 1)
     
     # Draw letter boxes
@@ -612,12 +612,12 @@ def main():
     print(f"\n   Static letters (A-G, I-Y): {FRAMES_STATIC} frames, {TARGET_STATIC} samples each")
     print(f"   Dynamic letters (H, J, Z): {FRAMES_DYNAMIC} frames, {TARGET_DYNAMIC} samples each")
     print("\n   Controls:")
-    print("   0-9     = Select letters A-J")
-    print("   A-Z     = Select letter directly")
-    print("   SPACE   = Start recording")
-    print("   P       = Preview last recording")
-    print("   R       = Delete last sample for current letter")
-    print("   Q       = Quit and save")
+    print("   0-9       = Select letters A-J")
+    print("   A-Z       = Select letter directly")
+    print("   SPACE     = Start/Stop recording")
+    print("   TAB       = Preview last recording")
+    print("   BACKSPACE = Delete last sample for current letter")
+    print("   ESC       = Quit and save")
     print("="*65 + "\n")
     
     # Load existing data
@@ -736,7 +736,7 @@ def main():
         # Handle input
         key = cv2.waitKey(1) & 0xFF
         
-        if key == ord('q'):
+        if key == 27:  # ESC - Quit
             break
         
         elif key == ord(' '):  # SPACE - Start/Stop recording
@@ -760,7 +760,7 @@ def main():
                     
                     count = sample_counts.get(current_letter, 0)
                     print(f"   ✅ Saved {current_letter} sample #{count} ({len(frames_buffer)} frames)")
-                    print(f"   💡 Press P to preview")
+                    print(f"   💡 Press TAB to preview")
                     
                     # AUTO-SAVE to CSV
                     save_data(df)
@@ -784,7 +784,7 @@ def main():
             elif not hand_detected:
                 print("   ⚠️  Show your hand first!")
         
-        elif key == ord('r'):  # R - Delete last sample
+        elif key == 8 or key == 127:  # Backspace - Delete last sample
             if current_letter:
                 df, deleted = delete_last_sample(df, current_letter)
                 if deleted:
@@ -794,7 +794,7 @@ def main():
                 else:
                     print(f"   ⚠️  No samples to delete for {current_letter}")
         
-        elif key == ord('p'):  # P - Preview last recording
+        elif key == 9:  # Tab - Preview last recording
             if last_frames and current_letter:
                 print(f"\n   👁️  Showing preview of last {current_letter} recording...")
                 show_preview(last_frames, current_letter)
